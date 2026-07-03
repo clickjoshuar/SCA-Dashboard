@@ -21,6 +21,27 @@ const headers = {
   "Content-Type": "application/json",
 };
 
+// Small pause helper
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Rate-limit-safe fetch: paces requests and auto-retries on 429 (HubSpot's
+// per-second cap). Waits a moment and retries up to 5 times before giving up.
+let lastCall = 0;
+const MIN_GAP_MS = 120; // ~8 requests/sec, safely under HubSpot's limit
+async function hsFetch(url, options = {}, attempt = 0) {
+  const wait = Math.max(0, MIN_GAP_MS - (Date.now() - lastCall));
+  if (wait) await sleep(wait);
+  lastCall = Date.now();
+
+  const r = await fetch(url, options);
+  if (r.status === 429 && attempt < 5) {
+    // Back off progressively: 0.5s, 1s, 2s, 4s, 8s
+    await sleep(500 * Math.pow(2, attempt));
+    return hsFetch(url, options, attempt + 1);
+  }
+  return r;
+}
+
 async function searchDeals(filters, properties, cap = 5000) {
   let results = [], after = undefined;
   do {
@@ -30,7 +51,7 @@ async function searchDeals(filters, properties, cap = 5000) {
       limit: 200,
       ...(after ? { after } : {}),
     };
-    const r = await fetch(`${HS}/crm/v3/objects/deals/search`, {
+    const r = await hsFetch(`${HS}/crm/v3/objects/deals/search`, {
       method: "POST", headers, body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(`HubSpot deals search failed: ${r.status} ${await r.text()}`);
@@ -42,7 +63,7 @@ async function searchDeals(filters, properties, cap = 5000) {
 }
 
 async function getOwners() {
-  const r = await fetch(`${HS}/crm/v3/owners?limit=500`, { headers });
+  const r = await hsFetch(`${HS}/crm/v3/owners?limit=500`, { headers });
   if (!r.ok) throw new Error(`Owners fetch failed: ${r.status}`);
   const data = await r.json();
   const map = {};
@@ -61,7 +82,7 @@ async function getUnitsByProduct(dealIds) {
   let jadeUnits = 0;
   for (let i = 0; i < dealIds.length; i += 500) {
     const batch = dealIds.slice(i, i + 500);
-    const ar = await fetch(`${HS}/crm/v4/associations/deals/line_items/batch/read`, {
+    const ar = await hsFetch(`${HS}/crm/v4/associations/deals/line_items/batch/read`, {
       method: "POST", headers,
       body: JSON.stringify({ inputs: batch.map(id => ({ id })) }),
     });
@@ -69,7 +90,7 @@ async function getUnitsByProduct(dealIds) {
     const assoc = await ar.json();
     const liIds = (assoc.results || []).flatMap(x => (x.to || []).map(t => t.toObjectId));
     for (let j = 0; j < liIds.length; j += 100) {
-      const lr = await fetch(`${HS}/crm/v3/objects/line_items/batch/read`, {
+      const lr = await hsFetch(`${HS}/crm/v3/objects/line_items/batch/read`, {
         method: "POST", headers,
         body: JSON.stringify({
           inputs: liIds.slice(j, j + 100).map(id => ({ id: String(id) })),
