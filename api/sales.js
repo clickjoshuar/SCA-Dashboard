@@ -43,32 +43,38 @@ async function hsFetch(url, options = {}, attempt = 0) {
 }
 
 // Read SCA's deal pipelines and figure out which stages count as "won".
-// A stage is won when HubSpot marks it probability 1.0, or its label says "won".
+// Revenue-recognition stages, confirmed by SCA. A deal counts as revenue when
+// it reaches ANY of these stages in its pipeline (matched by exact stage ID).
+//   Commercial:  Quote Approved + Closed Won
+//   Inside Sales: Order Approved + Closed Won
+//   Distributor: Order Shipped + Closed Won
+const REVENUE_STAGE_IDS = {
+  // Commercial
+  "1355604553": "Outside", // Quote Approved
+  "1320646543": "Outside", // Closed Won
+  // Inside Sales
+  "1355608437": "Inside",  // Order Approved
+  "1341580175": "Inside",  // Closed Won
+  // Distributor
+  "1341577373": "Outside", // Order Shipped
+  "1341577375": "Outside", // Closed Won
+};
+
 async function getPipelineConfig() {
   const r = await hsFetch(`${HS}/crm/v3/pipelines/deals`, { headers });
   if (!r.ok) throw new Error(`Pipelines fetch failed: ${r.status} ${await r.text()}`);
   const data = await r.json();
 
-  const wonStageIds = [];
+  const wonStageIds = Object.keys(REVENUE_STAGE_IDS);
+  const stageTeam = { ...REVENUE_STAGE_IDS };
   const pipelineIds = [];
-  const stageTeam = {};   // stageId -> "Inside" | "Outside"
-  const matched = [];     // pipeline labels we matched (for debugging)
+  const matched = [];
 
   for (const p of data.results || []) {
     const team = TEAM_BY_PIPELINE[(p.label || "").trim().toLowerCase()];
     if (!team) continue; // ignore pipelines we don't track
     pipelineIds.push(p.id);
     matched.push(p.label);
-    for (const s of p.stages || []) {
-      const prob = s.metadata?.probability;
-      const isWon =
-        prob === "1.0" || prob === 1 || Number(prob) === 1 ||
-        (s.metadata?.isClosed === "true" && (s.label || "").toLowerCase().includes("won"));
-      if (isWon) {
-        wonStageIds.push(s.id);
-        stageTeam[s.id] = team;
-      }
-    }
   }
   return { wonStageIds, pipelineIds, stageTeam, matched };
 }
