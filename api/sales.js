@@ -199,6 +199,35 @@ export default async function handler(req, res) {
       ["amount", "closedate", "hubspot_owner_id", "dealstage", "pipeline"]
     );
 
+    // DEBUG: /api/sales?deals=1 shows what the stage filter actually returned —
+    // the real dealstage/pipeline/team on a sample of deals, so we can see why
+    // the tagging is off.
+    if (req.query?.deals || (req.url || "").includes("deals=1")) {
+      const teamCounts = {};
+      const stageCounts = {};
+      for (const d of deals) {
+        const st = d.properties.dealstage;
+        const tm = stageTeam[st] || "(default Inside)";
+        teamCounts[tm] = (teamCounts[tm] || 0) + 1;
+        stageCounts[st] = (stageCounts[st] || 0) + 1;
+      }
+      return res.status(200).json({
+        wonStageIds,
+        totalDealsReturned: deals.length,
+        teamCounts,
+        stageCounts,
+        sample: deals.slice(0, 8).map((d) => ({
+          id: d.id,
+          dealstage: d.properties.dealstage,
+          pipeline: d.properties.pipeline,
+          closedate: d.properties.closedate,
+          amount: d.properties.amount,
+          owner: d.properties.hubspot_owner_id,
+          teamResolved: stageTeam[d.properties.dealstage] || "(default Inside)",
+        })),
+      });
+    }
+
     // 2. Open pipeline (still-open deals in our pipelines)
     const openDeals = await searchDeals(
       [
