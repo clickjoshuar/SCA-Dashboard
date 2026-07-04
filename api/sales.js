@@ -14,6 +14,13 @@ const TEAM_BY_PIPELINE = {
   "distributor": "Outside",
 };
 
+// Owners to hide from the dashboard (own deals but aren't sales reps).
+// Defaults: Josh Click, Nathanael Bennett. Add more IDs via env, comma-separated.
+const EXCLUDED_OWNER_IDS = new Set(
+  (process.env.EXCLUDED_OWNER_IDS || "80759361,91191922")
+    .split(",").map((s) => s.trim()).filter(Boolean)
+);
+
 // Manually managed inventory (update in Vercel env vars, no redeploy needed)
 const JADE_INVENTORY_START = Number(process.env.JADE_INVENTORY_START || 1000);
 
@@ -270,6 +277,7 @@ export default async function handler(req, res) {
     for (const d of deals) {
       const amt = Number(d.properties.amount || 0);
       const owner = d.properties.hubspot_owner_id || "unassigned";
+      if (EXCLUDED_OWNER_IDS.has(owner)) continue; // hide non-rep owners
       const team = stageTeam[d.properties.dealstage] || "Inside";
       ownerTeam[owner] = team;
 
