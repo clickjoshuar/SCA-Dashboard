@@ -114,6 +114,7 @@ async function getOwnerNames() {
 // Count product units from won deals' line items
 async function getUnitsByProduct(dealIds) {
   const units = {};
+  const rawNames = {}; // exact line-item name -> total quantity (for diagnostics)
   let jadeUnits = 0;
   for (let i = 0; i < dealIds.length; i += 500) {
     const batch = dealIds.slice(i, i + 500);
@@ -135,19 +136,24 @@ async function getUnitsByProduct(dealIds) {
       if (!lr.ok) continue;
       const lines = await lr.json();
       for (const li of lines.results || []) {
-        const name = (li.properties.name || "Other").toUpperCase();
+        const rawName = li.properties.name || "(no name)";
+        const name = rawName.toUpperCase();
         const qty = Number(li.properties.quantity || 1);
+        rawNames[rawName] = (rawNames[rawName] || 0) + qty;
+
+        // Check FILTER first so "JADE 2.0 Filter" counts as a filter, not a unit.
+        const isFilter = name.includes("FILTER") || name.includes("REPLACEMENT");
         const key =
-          name.includes("JADE") ? "JADE 2.0" :
+          isFilter ? "Filters" :
+          (name.includes("JADE") && name.includes("2.0")) ? "JADE 2.0" :
           name.includes("COBALT") ? "COBALT" :
-          name.includes("ONYX") ? "ONYX" :
-          name.includes("FILTER") ? "Filters" : "Other";
+          name.includes("ONYX") ? "ONYX" : "Other";
         units[key] = (units[key] || 0) + qty;
         if (key === "JADE 2.0") jadeUnits += qty;
       }
     }
   }
-  return { units, jadeUnits };
+  return { units, jadeUnits, rawNames };
 }
 
 export default async function handler(req, res) {
@@ -294,7 +300,21 @@ export default async function handler(req, res) {
     }
 
     // 5. Product units from won deal line items
-    const { units, jadeUnits } = await getUnitsByProduct(thisYearDealIds);
+    const { units, jadeUnits, rawNames } = await getUnitsByProduct(thisYearDealIds);
+
+    // DEBUG: /api/sales?units=1 shows every distinct line-item name and its
+    // total quantity, so we can see exactly what's being counted as JADE.
+    if (req.query?.units || (req.url || "").includes("units=1")) {
+      const sortedNames = Object.entries(rawNames)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, qty]) => ({ name, qty }));
+      return res.status(200).json({
+        dealsWithLineItemsScanned: thisYearDealIds.length,
+        categorizedUnits: units,
+        jadeUnits,
+        distinctProductNames: sortedNames,
+      });
+    }
 
     res.setHeader("Cache-Control", "s-maxage=300"); // cache 5 min
     res.status(200).json({
