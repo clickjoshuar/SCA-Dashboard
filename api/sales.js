@@ -152,7 +152,32 @@ export default async function handler(req, res) {
     const startLastYear = Date.UTC(thisYear - 1, 0, 1);
 
     // 0. Figure out which pipelines + won stages to use
-    const { wonStageIds, pipelineIds, stageTeam } = await getPipelineConfig();
+    const { wonStageIds, pipelineIds, stageTeam, matched } = await getPipelineConfig();
+
+    // DEBUG: /api/sales?debug=1 dumps the raw pipeline config so we can see
+    // exactly what HubSpot returns (every pipeline, every stage, won or not).
+    if (req.query?.debug || (req.url || "").includes("debug=1")) {
+      const raw = await hsFetch(`${HS}/crm/v3/pipelines/deals`, { headers });
+      const rawData = raw.ok ? await raw.json() : { error: raw.status };
+      const pipelineDump = (rawData.results || []).map((p) => ({
+        label: p.label,
+        id: p.id,
+        matchedTeam: TEAM_BY_PIPELINE[(p.label || "").trim().toLowerCase()] || "(not matched)",
+        stages: (p.stages || []).map((s) => ({
+          label: s.label,
+          id: s.id,
+          probability: s.metadata?.probability,
+          isClosed: s.metadata?.isClosed,
+          countedAsWon: wonStageIds.includes(s.id),
+        })),
+      }));
+      return res.status(200).json({
+        matchedPipelines: matched,
+        wonStageCount: wonStageIds.length,
+        pipelines: pipelineDump,
+      });
+    }
+
     if (!wonStageIds.length) {
       return res.status(500).json({
         error: "No won stages found in Inside Sales / Commercial / Distributor pipelines. Check the pipeline names in HubSpot match exactly.",
