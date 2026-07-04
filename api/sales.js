@@ -1,19 +1,23 @@
 // /api/sales.js — Vercel serverless function
-// Pulls closed-won deals + owners + open pipeline from HubSpot and
-// returns aggregated data for the dashboard. Token never reaches the browser.
+// Pulls WON deals from SCA's real pipelines (Inside Sales, Commercial, Distributor),
+// plus owners and open pipeline, and returns aggregated data for the dashboard.
+// Team is decided by PIPELINE so the roster self-maintains as reps come and go.
+// Token never reaches the browser.
 
 const HS = "https://api.hubapi.com";
 const TOKEN = process.env.HUBSPOT_TOKEN;
 
-// Optional: comma-separated HubSpot owner IDs for the OUTSIDE team, e.g. "1234,5678"
-const OUTSIDE_IDS = (process.env.OUTSIDE_OWNER_IDS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+// Which pipeline belongs to which team (matched by name, case-insensitive).
+const TEAM_BY_PIPELINE = {
+  "inside sales": "Inside",
+  "commercial": "Outside",
+  "distributor": "Outside",
+};
 
-// Manually managed inventory numbers (update in Vercel env vars, no redeploy needed)
+// Manually managed inventory (update in Vercel env vars, no redeploy needed)
 const JADE_INVENTORY_START = Number(process.env.JADE_INVENTORY_START || 1000);
 
-// Monthly revenue goal for the pace bar. No sensible default, so null when unset —
-// the dashboard hides the pace bar rather than inventing a target.
+// Monthly revenue goal for the pace bar. Null when unset -> dashboard hides the bar.
 const MONTHLY_TARGET = process.env.MONTHLY_TARGET ? Number(process.env.MONTHLY_TARGET) : null;
 
 const headers = {
@@ -21,25 +25,52 @@ const headers = {
   "Content-Type": "application/json",
 };
 
-// Small pause helper
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Rate-limit-safe fetch: paces requests and auto-retries on 429 (HubSpot's
-// per-second cap). Waits a moment and retries up to 5 times before giving up.
+// Rate-limit-safe fetch: paces requests (~8/sec) and auto-retries on 429.
 let lastCall = 0;
-const MIN_GAP_MS = 120; // ~8 requests/sec, safely under HubSpot's limit
+const MIN_GAP_MS = 120;
 async function hsFetch(url, options = {}, attempt = 0) {
   const wait = Math.max(0, MIN_GAP_MS - (Date.now() - lastCall));
   if (wait) await sleep(wait);
   lastCall = Date.now();
-
   const r = await fetch(url, options);
   if (r.status === 429 && attempt < 5) {
-    // Back off progressively: 0.5s, 1s, 2s, 4s, 8s
     await sleep(500 * Math.pow(2, attempt));
     return hsFetch(url, options, attempt + 1);
   }
   return r;
+}
+
+// Read SCA's deal pipelines and figure out which stages count as "won".
+// A stage is won when HubSpot marks it probability 1.0, or its label says "won".
+async function getPipelineConfig() {
+  const r = await hsFetch(`${HS}/crm/v3/pipelines/deals`, { headers });
+  if (!r.ok) throw new Error(`Pipelines fetch failed: ${r.status} ${await r.text()}`);
+  const data = await r.json();
+
+  const wonStageIds = [];
+  const pipelineIds = [];
+  const stageTeam = {};   // stageId -> "Inside" | "Outside"
+  const matched = [];     // pipeline labels we matched (for debugging)
+
+  for (const p of data.results || []) {
+    const team = TEAM_BY_PIPELINE[(p.label || "").trim().toLowerCase()];
+    if (!team) continue; // ignore pipelines we don't track
+    pipelineIds.push(p.id);
+    matched.push(p.label);
+    for (const s of p.stages || []) {
+      const prob = s.metadata?.probability;
+      const isWon =
+        prob === "1.0" || prob === 1 || Number(prob) === 1 ||
+        (s.metadata?.isClosed === "true" && (s.label || "").toLowerCase().includes("won"));
+      if (isWon) {
+        wonStageIds.push(s.id);
+        stageTeam[s.id] = team;
+      }
+    }
+  }
+  return { wonStageIds, pipelineIds, stageTeam, matched };
 }
 
 async function searchDeals(filters, properties, cap = 5000) {
@@ -62,23 +93,20 @@ async function searchDeals(filters, properties, cap = 5000) {
   return results;
 }
 
-async function getOwners() {
+async function getOwnerNames() {
   const r = await hsFetch(`${HS}/crm/v3/owners?limit=500`, { headers });
   if (!r.ok) throw new Error(`Owners fetch failed: ${r.status}`);
   const data = await r.json();
-  const map = {};
+  const names = {};
   for (const o of data.results || []) {
-    map[o.id] = {
-      name: [o.firstName, o.lastName].filter(Boolean).join(" ") || o.email || `Owner ${o.id}`,
-      team: OUTSIDE_IDS.includes(String(o.id)) ? "Outside" : "Inside",
-    };
+    names[o.id] = [o.firstName, o.lastName].filter(Boolean).join(" ") || o.email || `Owner ${o.id}`;
   }
-  return map;
+  return names;
 }
 
-// Fetch line items for a set of deal IDs to count units per product
+// Count product units from won deals' line items
 async function getUnitsByProduct(dealIds) {
-  const units = {}; // { "JADE 2.0": 12, ... }
+  const units = {};
   let jadeUnits = 0;
   for (let i = 0; i < dealIds.length; i += 500) {
     const batch = dealIds.slice(i, i + 500);
@@ -123,18 +151,29 @@ export default async function handler(req, res) {
     const thisYear = now.getFullYear();
     const startLastYear = Date.UTC(thisYear - 1, 0, 1);
 
-    // 1. All closed-won deals since Jan 1 of LAST year (for YoY)
+    // 0. Figure out which pipelines + won stages to use
+    const { wonStageIds, pipelineIds, stageTeam } = await getPipelineConfig();
+    if (!wonStageIds.length) {
+      return res.status(500).json({
+        error: "No won stages found in Inside Sales / Commercial / Distributor pipelines. Check the pipeline names in HubSpot match exactly.",
+      });
+    }
+
+    // 1. Won deals since Jan 1 last year (for YoY), in our pipelines' won stages
     const deals = await searchDeals(
       [
-        { propertyName: "hs_is_closed_won", operator: "EQ", value: "true" },
+        { propertyName: "dealstage", operator: "IN", values: wonStageIds },
         { propertyName: "closedate", operator: "GTE", value: String(startLastYear) },
       ],
-      ["amount", "closedate", "hubspot_owner_id"]
+      ["amount", "closedate", "hubspot_owner_id", "dealstage", "pipeline"]
     );
 
-    // 2. Open pipeline
+    // 2. Open pipeline (still-open deals in our pipelines)
     const openDeals = await searchDeals(
-      [{ propertyName: "hs_is_closed", operator: "EQ", value: "false" }],
+      [
+        { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
+        { propertyName: "pipeline", operator: "IN", values: pipelineIds },
+      ],
       ["amount"]
     );
     const pipeline = {
@@ -142,18 +181,22 @@ export default async function handler(req, res) {
       count: openDeals.length,
     };
 
-    // 3. Owners
-    const owners = await getOwners();
+    // 3. Owner display names
+    const ownerNames = await getOwnerNames();
 
-    // 4. Aggregate
-    const monthly = {};        // "2026-06" -> { total, byRep: {ownerId: rev} }
-    const lastYearMonthly = {}; // "2025-06" -> total
-    const daily = {};           // day of current month -> { total, byRep }
+    // 4. Aggregate; team is derived from each deal's pipeline (via its won stage)
+    const monthly = {};
+    const lastYearMonthly = {};
+    const daily = {};
     const thisYearDealIds = [];
+    const ownerTeam = {}; // ownerId -> "Inside" | "Outside"
 
     for (const d of deals) {
       const amt = Number(d.properties.amount || 0);
       const owner = d.properties.hubspot_owner_id || "unassigned";
+      const team = stageTeam[d.properties.dealstage] || "Inside";
+      ownerTeam[owner] = team;
+
       const dt = new Date(d.properties.closedate);
       const ym = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}`;
 
@@ -174,7 +217,13 @@ export default async function handler(req, res) {
       }
     }
 
-    // 5. Units per product from line items (this year's won deals)
+    // Build owners map (name + team) for everyone who has won deals
+    const owners = {};
+    for (const id of Object.keys(ownerTeam)) {
+      owners[id] = { name: ownerNames[id] || `Owner ${id}`, team: ownerTeam[id] };
+    }
+
+    // 5. Product units from won deal line items
     const { units, jadeUnits } = await getUnitsByProduct(thisYearDealIds);
 
     res.setHeader("Cache-Control", "s-maxage=300"); // cache 5 min
