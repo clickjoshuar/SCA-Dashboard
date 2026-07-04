@@ -146,15 +146,27 @@ async function getUnitsByProduct(dealIds) {
         const rawName = li.properties.name || "(no name)";
         const name = rawName.toUpperCase();
         const qty = Number(li.properties.quantity || 1);
+        if (qty <= 0) continue; // skip credits, invoices, freight (negative/zero qty)
         rawNames[rawName] = (rawNames[rawName] || 0) + qty;
 
-        // Check FILTER first so "JADE 2.0 Filter" counts as a filter, not a unit.
-        const isFilter = name.includes("FILTER") || name.includes("REPLACEMENT");
-        const key =
-          isFilter ? "Filters" :
-          (name.includes("JADE") && name.includes("2.0")) ? "JADE 2.0" :
-          name.includes("COBALT") ? "COBALT" :
-          name.includes("ONYX") ? "ONYX" : "Other";
+        // A "unit sold" = an actual air purifier. Exclude filters, lamps, caps,
+        // boards, brackets, cables, freight, invoices, service lines, etc.
+        // UV lamps are treated as a consumable, counted under Filters.
+        const isPurifier = name.includes("AIR PURIFIER");
+        const isFilterOrLamp =
+          name.includes("FILTER") || name.includes("UV LAMP") || name.includes("UV-C");
+        let key;
+        if (!isPurifier) {
+          key = isFilterOrLamp ? "Filters" : "Other";
+        } else if (name.includes("JADE") && name.includes("2.0")) {
+          key = "JADE 2.0";
+        } else if (name.includes("COBALT")) {
+          key = "COBALT";
+        } else if (name.includes("ONYX")) {
+          key = "ONYX";
+        } else {
+          key = "Other";
+        }
         units[key] = (units[key] || 0) + qty;
         if (key === "JADE 2.0") jadeUnits += qty;
       }
@@ -213,6 +225,7 @@ export default async function handler(req, res) {
           [
             { propertyName: "dealstage", operator: "EQ", value: stageId },
             { propertyName: "closedate", operator: "GTE", value: String(startLastYear) },
+            { propertyName: "amount", operator: "GT", value: "0" },
           ],
           ["amount", "closedate", "hubspot_owner_id", "dealstage", "pipeline"],
           3000,
@@ -277,7 +290,7 @@ export default async function handler(req, res) {
     for (const d of deals) {
       const amt = Number(d.properties.amount || 0);
       const owner = d.properties.hubspot_owner_id || "unassigned";
-      if (EXCLUDED_OWNER_IDS.has(owner)) continue; // hide non-rep owners
+      if (owner === "unassigned" || EXCLUDED_OWNER_IDS.has(owner)) continue; // hide non-reps
       const team = stageTeam[d.properties.dealstage] || "Inside";
       ownerTeam[owner] = team;
 
