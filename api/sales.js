@@ -79,13 +79,14 @@ async function getPipelineConfig() {
   return { wonStageIds, pipelineIds, stageTeam, matched };
 }
 
-async function searchDeals(filters, properties, cap = 5000) {
+async function searchDeals(filters, properties, cap = 5000, sorts = null) {
   let results = [], after = undefined;
   do {
     const body = {
       filterGroups: [{ filters }],
       properties,
       limit: 200,
+      ...(sorts ? { sorts } : {}),
       ...(after ? { after } : {}),
     };
     const r = await hsFetch(`${HS}/crm/v3/objects/deals/search`, {
@@ -190,14 +191,23 @@ export default async function handler(req, res) {
       });
     }
 
-    // 1. Won deals since Jan 1 last year (for YoY), in our pipelines' won stages
-    const deals = await searchDeals(
-      [
-        { propertyName: "dealstage", operator: "IN", values: wonStageIds },
-        { propertyName: "closedate", operator: "GTE", value: String(startLastYear) },
-      ],
-      ["amount", "closedate", "hubspot_owner_id", "dealstage", "pipeline"]
+    // 1. Won deals since Jan 1 last year (for YoY). Query EACH revenue stage
+    // separately, newest close date first, so one huge stage (e.g. Commercial
+    // Closed Won) can't fill the result cap and starve the others.
+    const dealArrays = await Promise.all(
+      wonStageIds.map((stageId) =>
+        searchDeals(
+          [
+            { propertyName: "dealstage", operator: "EQ", value: stageId },
+            { propertyName: "closedate", operator: "GTE", value: String(startLastYear) },
+          ],
+          ["amount", "closedate", "hubspot_owner_id", "dealstage", "pipeline"],
+          3000,
+          [{ propertyName: "closedate", direction: "DESCENDING" }]
+        )
+      )
     );
+    const deals = dealArrays.flat();
 
     // DEBUG: /api/sales?deals=1 shows what the stage filter actually returned —
     // the real dealstage/pipeline/team on a sample of deals, so we can see why
